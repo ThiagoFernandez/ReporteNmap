@@ -1,7 +1,10 @@
 import socket
+from ast import arg
+from datetime import datetime
 
 import nmap
 from colorama import Fore, Style, init
+from nmap.nmap import PortScannerError
 
 import auxiliar
 
@@ -15,7 +18,7 @@ def show_reporte(reporte):
             print(f"{key} - {value}")
 
 
-def filter_args(opt):
+def filter_args(opt):  # podria ser una tupla y listo
     if "100" in opt:
         idx = opt.index("1")
         return opt[: idx + 3]
@@ -62,33 +65,85 @@ def nmap_scan():
     if target == -1:
         return
 
+    args = choose_arguments()
+
     try:
-        host = socket.gethostbyname(target)
-    except socket.gaierror:
-        print(f"{Fore.RED}Host inválido: {target}{Style.RESET_ALL}")
+        nm = nmap.PortScanner()
+        nm.scan(target, str(ports), arguments=args)
+    except PortScannerError as p:
+        print(f"{Fore.RED}No se encontro nmap: {p}{Style.RESET_ALL}")
+    except KeyboardInterrupt as k:
+        print(f"{Fore.YELLOW}Scan cancelado: {k}{Style.RESET_ALL}")
         return
 
-    nm = nmap.PortScanner()
-
-    resultado = nm.scan(host, str(ports), arguments=choose_arguments())
-    print(resultado)
-
     reporte = {
-        "host": host,
-        "ports": None,
-    }  # host, estado, puertos abiertos con servicio y versión
-    host_state = nm[host].state()
-    if host_state == "up":
-        open_ports = []
-        for port in nm[host]["tcp"].keys():
-            port_state = nm[host]["tcp"][port]["state"]
-            if port_state == "open":
-                name = nm[host]["tcp"][port].get("name", "desconocido/unknown")
-                version = nm[host]["tcp"][port].get("version", "desconocida/unknown")
+        # ─── Nivel scan ───
+        "target_original": target,  # consola
+        "ports_solicitados": ports,  # rango solicitado
+        "comando": nm.command_line(),  # nmap real, incluye target y flag
+        "timestamp": datetime.now().isoformat(),
+        "scanstats": nm.scanstats(),  # dict: elapsed, uphosts, downhosts, totalhosts, timestr
+        "scaninfo": nm.scaninfo(),  # dict: por protocolo, método y rango de puertos
+        # ─── Lista de hosts (1 para target unico, N para subred) ───
+        "hosts": [],
+    }
 
-                open_ports.append([name, version])
+    for ip in nm.all_hosts():
+        # Por cada IP que respondió, agregás esto a reporte["hosts"]:
+        host_info = {
+            "ip": ip,  # de nm.all_hosts()
+            "hostname": nm[ip].hostname(),  # str, puede ser ""
+            "hostnames": nm[ip].hostnames(),  # list[dict] — PTRs completos
+            "state": nm[ip].state(),  # "up" | "down" | ...
+            "protocols": nm[ip].all_protocols(),  # ["tcp", "udp", ...]
+            # Opcionales — solo si nmap los devuelve
+            "os": {
+                "name": nm[ip]["osmatch"]["name"],
+                "accuracy": f"{nm[ip]['osmatch']['accuracy']}%",
+            }
+            if "-O" in args
+            else None,  # solo si pediste -O y matcheó algo
+            "uptime": {
+                "days": nm[host]["osclass"][0]["uptime"]["days"],
+                "lastBoot": nm[host]["osclass"][0]["uptime"]["last_boot"],
+            }
+            if "-O" in args and "uptime" in nm[ip]['osclass']
+            else None,  # solo si -O lo detectó
+            "puertos": [],  # lista de dicts (ver abajo)
+        }
+        reporte["hosts"].append(host_info)
 
-        reporte["ports"] = open_ports
+    # Si nmap detectó OS, llenás "os":
+    if nm[ip].get("osmatch"):
+        mejor = nm[ip]["osmatch"][0]  # el de mayor accuracy
+        host_info["os"] = {
+            "name": mejor["name"],  # ej: "Linux 4.15 - 5.6"
+            "accuracy": mejor["accuracy"],  # str: "92"
+            "osclass": mejor.get("osclass"),  # lista con vendor/family/generation
+        }
+
+    # Si nmap devolvió uptime:
+    if nm[ip].get("uptime"):
+        host_info["uptime"] = {
+            "seconds": nm[ip]["uptime"].get("seconds"),
+            "lastboot": nm[ip]["uptime"].get("lastboot"),
+        }
+
+    # Por cada puerto en cada protocolo, agregás esto a host_info["puertos"]:
+    puerto_info = {
+        "port": port,  # int
+        "protocol": proto,  # "tcp" | "udp"
+        "state": nm[ip][proto][port].get("state"),
+        "reason": nm[ip][proto][port].get("reason"),  # "syn-ack", "conn-refused", etc.
+        "name": nm[ip][proto][port].get("name"),  # "ssh", "http", ...
+        "product": nm[ip][proto][port].get("product"),  # "OpenSSH", "Apache httpd"
+        "version": nm[ip][proto][port].get("version"),  # "8.9p1"
+        "extrainfo": nm[ip][proto][port].get(
+            "extrainfo"
+        ),  # "Ubuntu Linux; protocol 2.0"
+        "cpe": nm[ip][proto][port].get("cpe"),  # útil si después agregás CVE lookup
+        "conf": nm[ip][proto][port].get("conf"),  # confianza (1-10)
+    }
 
     show_reporte(reporte)
     auxiliar.save_file(reporte)

@@ -1,6 +1,11 @@
+import json
 import re
 import sys
 from datetime import datetime
+
+
+def generar_json(reporte: dict) -> str:
+    return json.dumps(reporte, indent=2, ensure_ascii=False, default=str)
 
 
 def guardar_reporte(contenido: str, target: str, ext: str) -> None:

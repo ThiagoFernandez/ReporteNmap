@@ -240,6 +240,11 @@ def nmap_scan():
 
     args = choose_arguments(ports)
 
+    print(f"{Fore.CYAN}Escaneando {target} con {args}{Style.RESET_ALL}")
+    print(
+        f"{Fore.YELLOW}Esto puede tardar varios minutos segun el tamaño del target...{Style.RESET_ALL}"
+    )
+
     try:
         nm = nmap.PortScanner()
         nm.scan(target, str(ports), arguments=args)
@@ -249,6 +254,8 @@ def nmap_scan():
     except KeyboardInterrupt as k:
         print(f"{Fore.YELLOW}Scan cancelado: {k}{Style.RESET_ALL}")
         return
+
+    print(f"{Fore.GREEN}Scan completo.{Style.RESET_ALL}")
 
     reporte = {
         # ─── Nivel scan ───
@@ -314,4 +321,4 @@ def nmap_scan():
     show_reporte(reporte)
     markdown = generar_markdown(reporte)
     auxiliar.guardar_reporte(markdown, target, "md")
-    auxiliar.guardar_reporte(markdown, target, "json")
+    auxiliar.generar_json(reporte)

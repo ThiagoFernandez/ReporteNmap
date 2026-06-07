@@ -1,21 +1,113 @@
+import os
+import time
 from datetime import datetime
 
 import nmap
+import requests
 from colorama import Fore, Style, init
 from nmap.nmap import PortScannerError
 from tabulate import tabulate
 
 import auxiliar
 
+NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+NVD_API_KEY = os.environ.get("NVD_API_KEY")  # None si no está seteada
+_cache_cve = {}  # cache por CPE: no repetir consultas
+
+
+def cpe22_a_23(cpe) -> str | None:
+    """nmap emite CPE 2.2 URI; NVD 2.0 quiere CPE 2.3 formatted string."""
+    if isinstance(cpe, list):  # nmap a veces devuelve lista
+        cpe = cpe[0] if cpe else None
+    if not cpe or not cpe.startswith("cpe:/"):
+        return None
+    partes = cpe[len("cpe:/") :].split(":")  # ["a","openbsd","openssh","8.9"]
+    partes += ["*"] * (11 - len(partes))  # rellenar a 11 campos
+    return "cpe:2.3:" + ":".join(partes[:11])
+
+
+def parsear_cve(v: dict) -> dict:
+    cve = v["cve"]
+    desc = next(
+        (d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"),
+        "sin descripcion",
+    )
+    score = "N/A"
+    metrics = cve.get("metrics", {})
+    for clave in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):  # nuevo -> viejo
+        if metrics.get(clave):
+            score = metrics[clave][0]["cvssData"]["baseScore"]
+            break
+    return {"id": cve["id"], "score": score, "desc": desc[:120]}
+
+
+def consultar_cves(cpe23: str) -> list[dict]:
+    if cpe23 in _cache_cve:  # cache hit: instant, sin sleep
+        return _cache_cve[cpe23]
+
+    params = {"cpeName": cpe23, "resultsPerPage": 20}
+    headers = {"apiKey": NVD_API_KEY} if NVD_API_KEY else {}
+
+    try:
+        r = requests.get(NVD_URL, params=params, headers=headers, timeout=15)
+        r.raise_for_status()
+        cves = [parsear_cve(v) for v in r.json().get("vulnerabilities", [])]
+    except requests.RequestException as e:
+        print(f"{Fore.RED}NVD fallo para {cpe23}: {e}{Style.RESET_ALL}")
+        cves = []  # degradar con gracia
+
+    _cache_cve[cpe23] = cves
+    time.sleep(0.6 if NVD_API_KEY else 6)  # respetar rate limit
+    return cves
+
+
+def enriquecer_con_cves(reporte: dict) -> None:
+    for host in reporte["hosts"]:
+        for p in host["puertos"]:
+            if p["state"] != "open":
+                continue
+            cpe23 = cpe22_a_23(p.get("cpe"))
+            if cpe23:
+                p["cves"] = consultar_cves(cpe23)
+
+
 init()
-SERVICIOS_CRITICOS = {  # cada uno pone lo q quiera aca
-    21: ("FTP", "Sin cifrado, credenciales en texto plano"),
-    22: ("SSH", "Verificar autenticación por clave, no por contraseña"),
-    23: ("Telnet", "Inseguro, reemplazar por SSH"),
-    80: ("HTTP", "Sin cifrar, verificar paneles admin expuestos"),
-    3306: ("MySQL", "BD expuesta, no debería ser accesible desde internet"),
-    3389: ("RDP", "Blanco frecuente, restringir acceso"),
-    445: ("SMB", "Verificar patches de EternalBlue"),
+SERVICIOS_CRITICOS = {
+    21: {
+        "nombre": "FTP",
+        "riesgo": "Protocolo sin cifrado; credenciales y datos viajan en texto plano",
+        "recomendacion": "Migrar a SFTP o FTPS; deshabilitar si no se usa",
+    },
+    22: {
+        "nombre": "SSH",
+        "riesgo": "Acceso remoto activo; objetivo frecuente de fuerza bruta",
+        "recomendacion": "Deshabilitar login por password (solo claves); considerar cambiar el puerto default",
+    },
+    23: {
+        "nombre": "Telnet",
+        "riesgo": "Sin cifrado; toda la sesion es visible para cualquiera en la red",
+        "recomendacion": "Reemplazar por SSH y cerrar el puerto 23",
+    },
+    80: {
+        "nombre": "HTTP",
+        "riesgo": "Trafico sin cifrar; posible panel de administracion expuesto",
+        "recomendacion": "Implementar HTTPS (443) y redirigir 80 a 443",
+    },
+    3306: {
+        "nombre": "MySQL",
+        "riesgo": "Base de datos accesible; exposicion de datos sensibles",
+        "recomendacion": "Restringir a red interna o localhost; nunca exponer a internet",
+    },
+    3389: {
+        "nombre": "RDP",
+        "riesgo": "Escritorio remoto; blanco frecuente de ransomware y fuerza bruta",
+        "recomendacion": "Restringir por VPN/firewall, habilitar NLA y MFA",
+    },
+    445: {
+        "nombre": "SMB",
+        "riesgo": "File sharing Windows; historico de exploits (EternalBlue)",
+        "recomendacion": "Aplicar parches, deshabilitar SMBv1, no exponer a internet",
+    },
 }
 
 
@@ -32,9 +124,12 @@ def generar_markdown(reporte: dict) -> str:
     lineas.append(f"**Timestamp:** {reporte['timestamp']}  ")
     lineas.append("**Scan info:**")
     for proto, info in reporte["scaninfo"].items():
-        lineas.append(
-            f"- `{proto}`: método `{info['method']}`, rango `{info['services']}`"
-        )
+        if isinstance(info, dict):
+            lineas.append(
+                f"- `{proto}`: método `{info.get('method', '?')}`, rango `{info.get('services', '?')}`"
+            )
+        else:
+            lineas.append(f"- `{proto}`: {info}")
     lineas.append(f"**Demoro:** {reporte['scanstats']['elapsed']}s  ")
     lineas.append(f"**Target:** {reporte['target_original']}  ")
     lineas.append(f"**Comando:** `{reporte['comando']}`  ")
@@ -47,6 +142,9 @@ def generar_markdown(reporte: dict) -> str:
     )
 
     lineas.append(f"---\n")
+    if not reporte["hosts"]:
+        lineas.append("\n*No se encontraron hosts activos para este target.*\n")
+        return "\n".join(lineas)
 
     for host in reporte["hosts"]:
         lineas.append(f"\n## {host['ip']}")
@@ -74,6 +172,8 @@ def generar_markdown(reporte: dict) -> str:
             lineas.append(f"**Uptime:** {format_uptime(host)}")
             lineas.append(f"**Ultimo reinicio(boot):** {host['uptime']['lastboot']}\n")
 
+        # podria hacer un list(host["puertos"].keys()) y listo
+        data = []
         if host["puertos"]:
             encabezados = [
                 "Puerto",
@@ -87,12 +187,12 @@ def generar_markdown(reporte: dict) -> str:
                 "ExtraInfo",
                 "CPE",
                 "CONF",
-            ]  # podria hacer un list(host["puertos"].keys()) y listo
+            ]
             data = []
-            destacados = []
+            criticos = []  # antes "destacados": ahora alimenta DOS secciones
             for p in host["puertos"]:
                 if p["state"] == "open" and p["port"] in SERVICIOS_CRITICOS:
-                    destacados.append(p)
+                    criticos.append(p)
                 data.append(
                     [
                         p["port"],
@@ -109,17 +209,41 @@ def generar_markdown(reporte: dict) -> str:
                     ]
                 )
 
-            tabla = tabulate(data, headers=encabezados, tablefmt="github")
-            lineas.append(tabla)
+            lineas.append(tabulate(data, headers=encabezados, tablefmt="github"))
 
-            if destacados:
+            if criticos:
+                # Servicios destacados --> el RIESGO
                 lineas.append("\n### Servicios destacados\n")
-                for p in destacados:
-                    nombre, nota = SERVICIOS_CRITICOS[p["port"]]
-                    lineas.append(f"- **{nombre} ({p['port']}):** {nota}")
+                for p in criticos:
+                    info = SERVICIOS_CRITICOS[p["port"]]
+                    lineas.append(
+                        f"- **{info['nombre']} ({p['port']}):** {info['riesgo']}"
+                    )
+
+                # Recomendaciones → la ACCIÓN (qué hacer)
+                lineas.append("\n### Recomendaciones\n")
+                for p in criticos:
+                    info = SERVICIOS_CRITICOS[p["port"]]
+                    lineas.append(
+                        f"- **{info['nombre']} ({p['port']}):** {info['recomendacion']}"
+                    )
+
+                # Vulnerabilidades conocidas (NVD)
+                con_cves = [p for p in host["puertos"] if p.get("cves")]
+                if con_cves:
+                    lineas.append("\n### Vulnerabilidades conocidas (NVD)\n")
+                    for p in con_cves:
+                        lineas.append(
+                            f"\n**{p['port']}/{p['protocol']} — {p.get('name') or '?'}** "
+                            f"({len(p['cves'])} CVEs)"
+                        )
+                        for cve in p["cves"]:
+                            lineas.append(
+                                f"- `{cve['id']}` (score {cve['score']}): {cve['desc']}"
+                            )
 
         else:
-            lineas.append(f"\n*Sin puertos detectados*\n")
+            lineas.append("\n*Sin puertos detectados*\n")
 
     return "\n".join(lineas)
 
@@ -233,30 +357,7 @@ def choose_arguments(mode):
     return argmnts
 
 
-def nmap_scan():
-    target, ports = auxiliar.validat_args()
-    if target == -1:
-        return
-
-    args = choose_arguments(ports)
-
-    print(f"{Fore.CYAN}Escaneando {target} con {args}{Style.RESET_ALL}")
-    print(
-        f"{Fore.YELLOW}Esto puede tardar varios minutos segun el tamaño del target...{Style.RESET_ALL}"
-    )
-
-    try:
-        nm = nmap.PortScanner()
-        nm.scan(target, str(ports), arguments=args)
-    except PortScannerError as p:
-        print(f"{Fore.RED}Error de nmap: {p}{Style.RESET_ALL}")
-        return
-    except KeyboardInterrupt as k:
-        print(f"{Fore.YELLOW}Scan cancelado: {k}{Style.RESET_ALL}")
-        return
-
-    print(f"{Fore.GREEN}Scan completo.{Style.RESET_ALL}")
-
+def generar_reporte(target, nm, ports):
     reporte = {
         # ─── Nivel scan ───
         "target_original": target,  # consola
@@ -318,7 +419,39 @@ def nmap_scan():
 
         reporte["hosts"].append(host_info)
 
-    show_reporte(reporte)
-    markdown = generar_markdown(reporte)
-    auxiliar.guardar_reporte(markdown, target, "md")
-    auxiliar.generar_json(reporte)
+    return reporte
+
+
+def nmap_scan():
+    nm = nmap.PortScanner()
+    targets, ports = auxiliar.validat_args()
+    if targets == -1:
+        return
+
+    args = choose_arguments(ports)
+
+    for target in targets:
+        print(f"{Fore.CYAN}Escaneando {target} con {args}{Style.RESET_ALL}")
+        print(
+            f"{Fore.YELLOW}Esto puede tardar varios minutos segun el tamaño del target...{Style.RESET_ALL}"
+        )
+        try:
+            nm.scan(str(target), str(ports), arguments=args)
+        except PortScannerError as p:
+            print(f"{Fore.RED}Error de nmap: {p}{Style.RESET_ALL}")
+            continue
+        except KeyboardInterrupt as k:
+            print(f"{Fore.YELLOW}Scan cancelado: {k}{Style.RESET_ALL}")
+            return
+
+        print(f"{Fore.GREEN}Scan completo.{Style.RESET_ALL}")
+
+        reporte = generar_reporte(target, nm, ports)
+        if "-sV" in args or "-A" in args:  # ← gating inteligente
+            print(
+                f"{Fore.CYAN}Consultando NVD para CVEs (puede tardar)...{Style.RESET_ALL}"
+            )
+            enriquecer_con_cves(reporte)
+        show_reporte(reporte)
+        auxiliar.guardar_reporte(generar_markdown(reporte), target, "md")
+        auxiliar.guardar_reporte(auxiliar.generar_json(reporte), target, "json")

@@ -16,6 +16,12 @@ def guardar_reporte(contenido: str, target: str, ext: str) -> None:
         f.write(contenido)
 
 
+def cargar_targets(path: str) -> list[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        lineas = [l.strip() for l in f]
+    return [l for l in lineas if l and not l.startswith("#")]
+
+
 def validate_ipv4(ip):  # -1 si es invalido
     # solo una barra
     if ip.count("/") != 1:
@@ -99,13 +105,18 @@ def validat_args():
 
     target = sys.argv[1]
 
+    if target.endswith(".txt"):
+        targets = cargar_targets(target)
+    else:
+        targets = [target]
+
     if len(sys.argv) == 3:
         puertos = validate_ports(sys.argv[2])
         if puertos == -1:
-            print("Mal pasados los puertos!")  # cambiar msj en un ftr
+            print("Mal pasados los puertos!")
             return -1, -1
-        return target, puertos
-    return target, ""
+        return targets, puertos
+    return targets, ""
 
 
 def show_options(options):

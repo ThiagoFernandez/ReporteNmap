@@ -3,16 +3,12 @@ import sys
 from datetime import datetime
 
 
-def save_file(dic):  # esto lo tengo q mjorar bastante
-    now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    with open(f"reporte_{dic['host']}_{now}.md", "w", encoding="UTF-8") as f:
-        for key, value in dic.items():
-            if key == "ports":
-                for p in value:
-                    rt = p[0] + "-" + p[1]
-                    f.write(rt)
-            else:
-                f.write(f"{value}\n")
+def guardar_reporte(contenido: str, target: str, ext: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    safe_target = target.replace("/", "_").replace(":", "_")
+    nombre = f"reporte_{safe_target}_{ts}.{ext}"
+    with open(nombre, "w", encoding="utf-8") as f:
+        f.write(contenido)
 
 
 def validate_ipv4(ip):  # -1 si es invalido
@@ -91,16 +87,20 @@ def validate_ports(ports: str):
 
 
 def validat_args():
-    if len(sys.argv) != 3:
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
         print("Uso: python main.py <red base, hostname o subred> <rangoPuertos>")
         print("Uso: python main.py x.com 1-1024")
         return -1, -1
-    puertos = validate_ports(sys.argv[2])
-    if puertos == -1:
-        print("Mal pasados los puertos!")  # cambiar msj en un ftr
-        return -1, -1
+
     target = sys.argv[1]
-    return target, puertos
+
+    if len(sys.argv) == 3:
+        puertos = validate_ports(sys.argv[2])
+        if puertos == -1:
+            print("Mal pasados los puertos!")  # cambiar msj en un ftr
+            return -1, -1
+        return target, puertos
+    return target, ""
 
 
 def show_options(options):
